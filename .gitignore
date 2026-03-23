@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pdf_page_*.png
+test_output.hwp
+alias_map.json
