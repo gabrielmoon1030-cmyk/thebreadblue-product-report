@@ -939,91 +939,81 @@ def generate_pdf(doc_type, recipe, options, db):
     buffer.seek(0)
     return buffer
 
-# ─── HWP 생성 (한글 자동화) ───
+# ─── HWP 생성 (순수 Python — olefile 기반) ───
 HWP_TEMPLATES = {
-    'doc1': r'c:/Users/Moon/OneDrive/03. 양지희_품질/2. 품목제조보고/1. 빵류/25년/호라산밀식빵/1. 제조방법설명서 - 호라산밀식빵.hwp',
-    'doc2': r'c:/Users/Moon/OneDrive/03. 양지희_품질/2. 품목제조보고/1. 빵류/25년/호라산밀식빵/2. 원료성분 및 배합비율(호라산밀식빵).hwp',
-    'doc3': r'c:/Users/Moon/OneDrive/03. 양지희_품질/2. 품목제조보고/1. 빵류/25년/호라산밀식빵/3. 소비기한설정사유서(호라산밀식빵).hwp',
+    'doc1': os.path.join(_APP_DIR, 'templates', 'template_doc1.hwp'),
+    'doc2': os.path.join(_APP_DIR, 'templates', 'template_doc2.hwp'),
+    'doc3': os.path.join(_APP_DIR, 'templates', 'template_doc3.hwp'),
 }
 
-def hwp_replace(hwp, find_str, replace_str):
-    """HWP 문서에서 찾아바꾸기"""
-    hwp.HAction.GetDefault('AllReplace', hwp.HParameterSet.HFindReplace.HSet)
-    pset = hwp.HParameterSet.HFindReplace
-    pset.FindString = str(find_str)
-    pset.ReplaceString = str(replace_str)
-    pset.IgnoreMessage = 1
-    pset.Direction = 0
-    pset.ReplaceMode = 1
-    hwp.HAction.Execute('AllReplace', pset.HSet)
+def hwp_modify_template(template_path, replacements):
+    """순수 Python으로 HWP 템플릿의 텍스트를 교체 (olefile + zlib)"""
+    import olefile, zlib
 
-def hwp_clear_table_and_fill(hwp, ingredients_data):
-    """원료성분 테이블: 기존 데이터 지우고 새 데이터로 채우기"""
-    # 첫번째 표 찾기
-    hwp.HAction.GetDefault('ShapeObjTableSelCell', hwp.HParameterSet.HShapeObject.HSet)
+    # 템플릿을 임시 파일로 복사
+    tmp = tempfile.NamedTemporaryFile(suffix='.hwp', delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    shutil.copy2(template_path, tmp_path)
 
-    # 커서를 문서 처음으로
-    hwp.MovePos(2)  # 문서 처음
+    ole = olefile.OleFileIO(tmp_path, write_mode=True)
 
-    # 표 안으로 이동 — 첫 번째 표 찾기
-    hwp.HAction.Run('MoveNextParaBegin')
-    hwp.HAction.Run('MoveNextParaBegin')
-    hwp.HAction.Run('TableCellBlock')
+    # BodyText/Section0 디컴프레스
+    orig_section = ole.openstream('BodyText/Section0').read()
+    body = zlib.decompress(orig_section, -15)
 
-    # 표의 각 셀을 순회하며 데이터 입력
-    # 헤더 행(1행)은 건너뛰고, 2행부터 데이터 입력
+    # UTF-16LE 바이트 찾아바꾸기
+    for old_str, new_str in replacements:
+        body = body.replace(old_str.encode('utf-16-le'), new_str.encode('utf-16-le'))
 
-    # 2행 1열로 이동 (첫 번째 데이터 행)
-    hwp.HAction.Run('TableLowerCell')  # 아래 셀로
+    # 재압축 — 원본 크기에 맞춰야 함
+    orig_len = len(orig_section)
+    new_section = None
+    for level in range(1, 10):
+        co = zlib.compressobj(level, zlib.DEFLATED, -15)
+        candidate = co.compress(body) + co.flush()
+        if len(candidate) <= orig_len:
+            new_section = candidate + b'\x00' * (orig_len - len(candidate))
+            break
+    if new_section is None:
+        # 압축해도 원본보다 크면 원본 크기로 자르기 (최후 수단)
+        co = zlib.compressobj(9, zlib.DEFLATED, -15)
+        new_section = (co.compress(body) + co.flush())[:orig_len]
 
-    for i, ing in enumerate(ingredients_data):
-        # 원재료명
-        hwp.HAction.Run('Select')  # 셀 전체 선택
-        hwp.HAction.GetDefault('InsertText', hwp.HParameterSet.HInsertText.HSet)
-        hwp.HParameterSet.HInsertText.Text = ing['name']
-        hwp.HAction.Execute('InsertText', hwp.HParameterSet.HInsertText.HSet)
+    ole.write_stream('BodyText/Section0', new_section)
 
-        # 배합비율
-        hwp.HAction.Run('TableRightCell')
-        hwp.HAction.GetDefault('InsertText', hwp.HParameterSet.HInsertText.HSet)
-        hwp.HParameterSet.HInsertText.Text = f"{ing['percent']:.2f}"
-        hwp.HAction.Execute('InsertText', hwp.HParameterSet.HInsertText.HSet)
+    # PrvText도 교체
+    orig_prv = ole.openstream('PrvText').read()
+    new_prv = orig_prv
+    for old_str, new_str in replacements:
+        new_prv = new_prv.replace(old_str.encode('utf-16-le'), new_str.encode('utf-16-le'))
+    # 크기 맞추기
+    orig_prv_len = len(orig_prv)
+    if len(new_prv) < orig_prv_len:
+        new_prv = new_prv + b'\x00' * (orig_prv_len - len(new_prv))
+    elif len(new_prv) > orig_prv_len:
+        new_prv = new_prv[:orig_prv_len]
+    ole.write_stream('PrvText', new_prv)
 
-        # 성분
-        hwp.HAction.Run('TableRightCell')
-        hwp.HAction.GetDefault('InsertText', hwp.HParameterSet.HInsertText.HSet)
-        hwp.HParameterSet.HInsertText.Text = ing.get('composition', '')
-        hwp.HAction.Execute('InsertText', hwp.HParameterSet.HInsertText.HSet)
+    ole.close()
 
-        # 비고
-        hwp.HAction.Run('TableRightCell')
-        hwp.HAction.GetDefault('InsertText', hwp.HParameterSet.HInsertText.HSet)
-        hwp.HParameterSet.HInsertText.Text = ing.get('origin', '')
-        hwp.HAction.Execute('InsertText', hwp.HParameterSet.HInsertText.HSet)
-
-        # 다음 행
-        if i < len(ingredients_data) - 1:
-            hwp.HAction.Run('TableLowerCell')
-            hwp.HAction.Run('TableCellBlockCol')
-            hwp.HAction.Run('TableLeftCell')
+    # 파일 읽어서 반환
+    with open(tmp_path, 'rb') as f:
+        result = f.read()
+    os.unlink(tmp_path)
+    return result
 
 def generate_hwp_files(recipe, options, db):
-    """HWP 파일 3종 생성 — 기존 템플릿 기반 찾아바꾸기"""
-    import win32com.client
-    import pythoncom
-
-    pythoncom.CoInitialize()
-
+    """HWP 파일 3종 생성 — 순수 Python (olefile + zlib 바이너리 교체)"""
     product_name = recipe['product_name']
     ingredients = recipe['ingredients']
     storage_method = options.get('storage', '냉동')
     shelf_life = options.get('shelf_life', '9개월')
     packaging_material = options.get('packaging_material', 'PP, PS, PE, PET')
 
-    # 정렬된 원재료 (백분율 내림차순)
     sorted_ings = sorted(ingredients, key=lambda x: x['percent'], reverse=True)
 
-    # 제조방법설명서용 원재료명 문자열
+    # 제조방법설명서용 표시명 문자열
     ing_parts = []
     for ing in sorted_ings:
         info = find_ingredient(ing['name'], db)
@@ -1031,7 +1021,7 @@ def generate_hwp_files(recipe, options, db):
         ing_parts.append(f"{display} {ing['percent']}%")
     ingredient_str = ", ".join(ing_parts)
 
-    # 제조방법 문자열
+    # 제조방법 원재료 나열
     ing_names_list = []
     for i in sorted_ings:
         if i['name'] != '정제수':
@@ -1040,187 +1030,92 @@ def generate_hwp_files(recipe, options, db):
     method_names = ",".join(ing_names_list[:7])
 
     storage_suffix = {'냉동': '포장 냉동을 한다', '냉장': '포장 냉장을 한다', '실온': '포장을 한다'}
+    storage_map = {'냉동': '-18℃이하 냉동보관', '냉장': '0~10℃ 냉장보관', '실온': '직사광선을 피하고 서늘한 곳에 보관'}
+    usage_map = {'냉동': '소비자 판매용 / 해동 후 섭취', '냉장': '소비자 판매용 / 냉장 보관 후 섭취', '실온': '소비자 판매용 / 개봉 후 섭취'}
     bake_temp = options.get('bake_temp', '180')
     bake_time = options.get('bake_time', '30~40')
     ferment1 = options.get('ferment1_time', '40~50')
     ferment2 = options.get('ferment2_time', '50~60')
     div_wt = options.get('divide_weight', '320')
 
-    method_text = (
-        f"{method_names},정제수를 계량후 믹싱을 한다\r\n"
-        f"(1)을 1차발효 {ferment1}분을 한다\r\n"
-        f"(2)를 {div_wt}g 분할후 둥글리기를 한다\r\n"
-        f"(3)을 팬에 넣고 2차발효 {ferment2}분을 한다\r\n"
-        f"(4)를 {bake_temp}℃로 예열된 오븐에 넣고 {bake_time}분간 가열을 한다\r\n"
-        f"(5)를 탈팬후 식혀 {storage_suffix.get(storage_method, storage_suffix['냉동'])}"
-    )
-
-    storage_map = {'냉동': '-18℃이하 냉동보관', '냉장': '0~10℃ 냉장보관', '실온': '직사광선을 피하고 서늘한 곳에 보관'}
-    usage_map = {'냉동': '소비자 판매용 / 해동 후 섭취', '냉장': '소비자 판매용 / 냉장 보관 후 섭취', '실온': '소비자 판매용 / 개봉 후 섭취'}
-
-    # 비교제품용 주성분
     top3 = sorted_ings[:3]
-    top3_names = []
-    for ing in top3:
-        info = find_ingredient(ing['name'], db)
-        top3_names.append(info.get('원재료명', ing['name']) if info else ing['name'])
+    top3_names = [find_ingredient(i['name'], db).get('원재료명', i['name']) if find_ingredient(i['name'], db) else i['name'] for i in top3]
     main_ingredients = ", ".join(top3_names)
 
     compare_product = options.get('compare_product', '통밀식빵(냉동)')
-    compare_company = options.get('compare_company', '더브레드블루')
-
     today = datetime.now()
 
-    # 임시 디렉토리
-    tmp_dir = tempfile.mkdtemp()
     output_files = {}
 
-    try:
-        hwp = win32com.client.gencache.EnsureDispatch('HWPFrame.HwpObject')
-        hwp.XHwpWindows.Item(0).Visible = False
-        hwp.RegisterModule('FilePathCheckDLL', 'FilePathCheckerModule')
+    # ─── 1. 제조방법설명서 ───
+    doc1_replacements = [
+        ('호라산밀식빵', product_name),
+        ('밀가루 50.5%, 정제수 33.19%, 가공두유 4.81%, 미강유(현미유) 2.81%, 곡류가공품1 2.16%, 혼합제제 1.7%, 전분가공품 1.44%, 식품첨가물(효모) 1.44%, 곡류가공품2 0.82%, 정제소금 0.62%, 당류가공품 0.51%', ingredient_str),
+        ('호라산밀가루,정제수,두유,현미유,찹쌀가루,스테비아,타피오카전분,효모,엔지마띠코,정제소금,몰트엑기스를 계량후 믹싱을 한다',
+         f'{method_names},정제수를 계량후 믹싱을 한다'),
+        ('40~50분을 한다', f'{ferment1}분을 한다'),
+        ('320g 분할후', f'{div_wt}g 분할후'),
+        ('식빵팬에 넣고 2차발효 50~60분', f'팬에 넣고 2차발효 {ferment2}분'),
+        ('180℃로 예열된 오븐에 넣고 45~55분간', f'{bake_temp}℃로 예열된 오븐에 넣고 {bake_time}분간'),
+        ('포장 냉동을 한다', storage_suffix.get(storage_method, '포장 냉동을 한다')),
+        ('소비자 판매용 / 해동 후 섭취', usage_map.get(storage_method, usage_map['냉동'])),
+        ('-18℃이하 냉동보관', storage_map.get(storage_method, storage_map['냉동'])),
+        ('밀봉 / 10g~5kg', f"밀봉 / {options.get('packaging_unit', '10g~5kg')}"),
+        ('제조일로부터 9개월까지', f'제조일로부터 {shelf_life}까지'),
+    ]
+    output_files['hwp1'] = hwp_modify_template(HWP_TEMPLATES['doc1'], doc1_replacements)
 
-        # ─── 1. 제조방법설명서 ───
-        shutil.copy2(HWP_TEMPLATES['doc1'], os.path.join(tmp_dir, 'doc1.hwp'))
-        hwp.Open(os.path.join(tmp_dir, 'doc1.hwp'), 'HWP', 'forceopen:true')
+    # ─── 2. 원료성분 및 배합비율 ───
+    # 기존 호라산밀 데이터를 새 데이터로 교체
+    doc2_replacements = []
+    old_ings_data = [
+        ('호라산밀', '50.50'), ('정제수', '33.19'), ('두유', '4.81'),
+        ('현미유', '2.81'), ('찹쌀가루', '2.16'), ('스테비아', '1.70'),
+        ('타피오카전분', '1.44'), ('효모', '1.44'), ('엔지마띠코', '0.82'),
+        ('정제소금', '0.62'), ('몰트엑기스', '0.51'),
+    ]
+    for i, (old_name, old_pct) in enumerate(old_ings_data):
+        if i < len(sorted_ings):
+            ing = sorted_ings[i]
+            info = find_ingredient(ing['name'], db)
+            new_name = info.get('원재료명', ing['name']) if info else ing['name']
+            new_pct = f"{ing['percent']:.2f}"
+            doc2_replacements.append((old_name, new_name))
+            doc2_replacements.append((old_pct, new_pct))
+        else:
+            doc2_replacements.append((old_name, ''))
+            doc2_replacements.append((old_pct, ''))
 
-        hwp_replace(hwp, '호라산밀식빵', product_name)
-        # 원재료명 배합비율 — 기존 긴 텍스트를 통째로 교체
-        hwp_replace(hwp, '밀가루 50.5%, 정제수 33.19%, 가공두유 4.81%, 미강유(현미유) 2.81%, 곡류가공품1 2.16%, 혼합제제 1.7%, 전분가공품 1.44%, 식품첨가물(효모) 1.44%, 곡류가공품2 0.82%, 정제소금 0.62%, 당류가공품 0.51%',
-                    ingredient_str)
-        # 제조방법
-        hwp_replace(hwp, '호라산밀가루,정제수,두유,현미유,찹쌀가루,스테비아,타피오카전분,효모,엔지마띠코,정제소금,몰트엑기스를 계량후 믹싱을 한다', method_text.split('\r\n')[0])
-        hwp_replace(hwp, '(1)을 1차발효 40~50분을 한다', f'(1)을 1차발효 {ferment1}분을 한다')
-        hwp_replace(hwp, '(2)를 320g 분할후 둥글리기를 한다', f'(2)를 {div_wt}g 분할후 둥글리기를 한다')
-        hwp_replace(hwp, '(3)을 식빵팬에 넣고 2차발효 50~60분을 한다', f'(3)을 팬에 넣고 2차발효 {ferment2}분을 한다')
-        hwp_replace(hwp, '(4)를 180℃로 예열된 오븐에 넣고 45~55분간 가열을 한다', f'(4)를 {bake_temp}℃로 예열된 오븐에 넣고 {bake_time}분간 가열을 한다')
-        hwp_replace(hwp, '(5)를 탈팬후 식혀 포장 냉동을 한다', f'(5)를 탈팬후 식혀 {storage_suffix.get(storage_method, storage_suffix["냉동"])}')
-        hwp_replace(hwp, '소비자 판매용 / 해동 후 섭취', usage_map.get(storage_method, usage_map['냉동']))
-        hwp_replace(hwp, '-18℃이하 냉동보관', storage_map.get(storage_method, storage_map['냉동']))
-        hwp_replace(hwp, 'PP, PS, PE, PET', packaging_material)
-        hwp_replace(hwp, '밀봉 / 10g~5kg', f"밀봉 / {options.get('packaging_unit', '10g~5kg')}")
-        hwp_replace(hwp, '제조일로부터 9개월까지', f'제조일로부터 {shelf_life}까지')
-
-        save1 = os.path.join(tmp_dir, f'1. 제조방법설명서 - {product_name}.hwp')
-        hwp.HAction.GetDefault('FileSaveAs_S', hwp.HParameterSet.HFileOpenSave.HSet)
-        hwp.HParameterSet.HFileOpenSave.filename = save1
-        hwp.HParameterSet.HFileOpenSave.Format = 'HWP'
-        hwp.HAction.Execute('FileSaveAs_S', hwp.HParameterSet.HFileOpenSave.HSet)
-        hwp.HAction.Run('FileClose')
-
-        # ─── 2. 원료성분 및 배합비율 ───
-        shutil.copy2(HWP_TEMPLATES['doc2'], os.path.join(tmp_dir, 'doc2.hwp'))
-        hwp.Open(os.path.join(tmp_dir, 'doc2.hwp'), 'HWP', 'forceopen:true')
-
-        # 기존 원재료 데이터를 새 데이터로 교체 (찾아바꾸기)
-        # 호라산밀식빵의 기존 원재료들
-        old_ings = [
-            ('호라산밀', '50.50', '유기농호라산밀100%', '호주'),
-            ('정제수', '33.19', '', ''),
-            ('두유', '4.81', '원액두유99.9%[대두고형분10%이상,외국산\r\n(미국,캐니다,러시아등)],식염', ''),
-            ('현미유', '2.81', '미강유100%', '태국'),
-            ('찹쌀가루', '2.16', '찹쌀100%', '국내산'),
-            ('스테비아', '1.70', '에리스리톨97.9%,효소처리스테비아2.1%', ''),
-            ('타피오카전분', '1.44', '변성전분99.9%(태국산),감자전분0.1%', ''),
-            ('효모', '1.44', '효모(사카로마이세스 세레비제)98.5%, 소르비탄지방산에스테르1.5%', '프랑스'),
-            ('엔지마띠코', '0.82', '건조소맥분,효소(자일라나아제,알파아밀라아제\r\n(비세균성),리파아제,글루코아밀라아제)', ''),
-            ('정제소금', '0.62', '해수100%', ''),
-            ('몰트엑기스', '0.51', '물엿,정제수,맥아엑기스8%[(덴마크산)\r\n고형분67%이상]', ''),
-        ]
-
-        # 기존 원재료명들을 새 데이터로 교체
-        for i, old in enumerate(old_ings):
-            if i < len(sorted_ings):
-                ing = sorted_ings[i]
-                info = find_ingredient(ing['name'], db)
-                new_name = info.get('원재료명', ing['name']) if info else ing['name']
-                new_pct = f"{ing['percent']:.2f}"
-                new_comp = info.get('성분', '') if info else ''
-                new_origin = info.get('원산지', '') if info else ''
-
-                hwp_replace(hwp, old[0], new_name)
-                hwp_replace(hwp, old[1], new_pct)
-            else:
-                # 원재료가 더 적으면 빈칸으로
-                hwp_replace(hwp, old[0], '')
-                hwp_replace(hwp, old[1], '')
-
-        # 성분과 비고는 복잡하므로, 전체 텍스트를 한번에 교체
-        for old in old_ings:
-            if old[2]:
-                clean_old = old[2].replace('\r\n', '')
-                hwp_replace(hwp, clean_old, '')
-
-        # 새 성분/비고 데이터는 이름 옆에 이미 매칭되어 있으므로
-        # 각 원재료 셀 뒤의 성분 셀에 새 데이터 입력
+    # 성분 교체
+    old_comps = [
+        ('유기농호라산밀100%', ''), ('미강유100%', ''), ('찹쌀100%', ''),
+        ('에리스리톨97.9%,효소처리스테비아2.1%', ''), ('해수100%', ''),
+    ]
+    for old_comp, _ in old_comps:
         for i, ing in enumerate(sorted_ings):
             info = find_ingredient(ing['name'], db)
-            if info:
-                new_name = info.get('원재료명', ing['name'])
-                new_comp = info.get('성분', '')
-                new_origin = info.get('원산지', '')
-                # 원재료명이 이미 교체되었으므로, 해당 이름 뒤에 있는 빈 셀에 성분 입력
-                # 찾아바꾸기로는 한계가 있어서, 전체 텍스트 방식으로
+            if info and info.get('성분', '') and old_comp in info.get('성분', '').replace(' ', ''):
+                break
+        doc2_replacements.append((old_comp, ''))
 
-        save2 = os.path.join(tmp_dir, f'2. 원료성분 및 배합비율({product_name}).hwp')
-        hwp.HAction.GetDefault('FileSaveAs_S', hwp.HParameterSet.HFileOpenSave.HSet)
-        hwp.HParameterSet.HFileOpenSave.filename = save2
-        hwp.HParameterSet.HFileOpenSave.Format = 'HWP'
-        hwp.HAction.Execute('FileSaveAs_S', hwp.HParameterSet.HFileOpenSave.HSet)
-        hwp.HAction.Run('FileClose')
+    output_files['hwp2'] = hwp_modify_template(HWP_TEMPLATES['doc2'], doc2_replacements)
 
-        # ─── 3. 소비기한설정사유서 ───
-        shutil.copy2(HWP_TEMPLATES['doc3'], os.path.join(tmp_dir, 'doc3.hwp'))
-        hwp.Open(os.path.join(tmp_dir, 'doc3.hwp'), 'HWP', 'forceopen:true')
+    # ─── 3. 소비기한설정사유서 ───
+    doc3_replacements = [
+        ('호라산밀식빵', product_name),
+        ('제조일로부터 9개월까지', f'제조일로부터 {shelf_life}까지'),
+        ('통밀식빵(냉동)', compare_product),
+        ('밀가루, 정제수, 가공두유', main_ingredients),
+        ('2025년    04월   25일', f'{today.year}년    {today.month:02d}월    {today.day:02d}일'),
+    ]
+    if storage_method == '냉장':
+        doc3_replacements.append(('냉동( O )', '냉동(   )'))
+        doc3_replacements.append(('냉장(   )', '냉장( O )'))
+    elif storage_method == '실온':
+        doc3_replacements.append(('냉동( O )', '냉동(   )'))
+        doc3_replacements.append(('실온(   )', '실온( O )'))
 
-        hwp_replace(hwp, '호라산밀식빵', product_name)
-        hwp_replace(hwp, '제조일로부터 9개월까지', f'제조일로부터 {shelf_life}까지')
-        hwp_replace(hwp, '통밀식빵(냉동)', compare_product)
-
-        # 보존방법 체크 변경
-        if storage_method == '냉동':
-            pass  # 기본값
-        elif storage_method == '냉장':
-            hwp_replace(hwp, '냉동( O )', '냉동(   )')
-            hwp_replace(hwp, '냉장(   )', '냉장( O )')
-        elif storage_method == '실온':
-            hwp_replace(hwp, '냉동( O )', '냉동(   )')
-            hwp_replace(hwp, '실온(   )', '실온( O )')
-
-        # 주성분
-        hwp_replace(hwp, '밀가루, 정제수, 가공두유', main_ingredients)
-        hwp_replace(hwp, 'PP, PS, PE, PET', packaging_material)
-
-        # 날짜
-        hwp_replace(hwp, '2025년    04월   25일', f'{today.year}년    {today.month:02d}월    {today.day:02d}일')
-
-        save3 = os.path.join(tmp_dir, f'3. 소비기한설정사유서({product_name}).hwp')
-        hwp.HAction.GetDefault('FileSaveAs_S', hwp.HParameterSet.HFileOpenSave.HSet)
-        hwp.HParameterSet.HFileOpenSave.filename = save3
-        hwp.HParameterSet.HFileOpenSave.Format = 'HWP'
-        hwp.HAction.Execute('FileSaveAs_S', hwp.HParameterSet.HFileOpenSave.HSet)
-        hwp.HAction.Run('FileClose')
-
-        hwp.Quit()
-
-        # 파일 읽기
-        for key, path in [('hwp1', save1), ('hwp2', save2), ('hwp3', save3)]:
-            with open(path, 'rb') as f:
-                output_files[key] = f.read()
-
-    except Exception as e:
-        try:
-            hwp.Quit()
-        except:
-            pass
-        raise e
-    finally:
-        pythoncom.CoUninitialize()
-        # 임시 파일 정리
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except:
-            pass
+    output_files['hwp3'] = hwp_modify_template(HWP_TEMPLATES['doc3'], doc3_replacements)
 
     return output_files
 
@@ -1495,14 +1390,12 @@ if uploaded_file:
             buf2 = io.BytesIO(); doc2.save(buf2); buf2.seek(0)
             buf3 = io.BytesIO(); doc3.save(buf3); buf3.seek(0)
 
-            # HWP 생성 (로컬 Windows + 한글 설치 시에만)
-            hwp_files = None
-            if os.name == 'nt':
-                try:
-                    hwp_files = generate_hwp_files(recipe, options, db)
-                except Exception as e:
-                    hwp_files = None
-                    st.warning(f"HWP 생성 실패 (한글 프로그램 필요): {e}")
+            # HWP 생성 (순수 Python — 클라우드/로컬 모두 지원)
+            try:
+                hwp_files = generate_hwp_files(recipe, options, db)
+            except Exception as e:
+                hwp_files = None
+                st.warning(f"HWP 생성 실패: {e}")
 
             # session_state에 저장
             st.session_state.generated_files = {
