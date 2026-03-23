@@ -941,9 +941,9 @@ def generate_pdf(doc_type, recipe, options, db):
 
 # ─── HWP 생성 (순수 Python — olefile 기반) ───
 HWP_TEMPLATES = {
-    'doc1': os.path.join(_APP_DIR, 'templates', 'template_doc1.hwp'),
-    'doc2': os.path.join(_APP_DIR, 'templates', 'template_doc2.hwp'),
-    'doc3': os.path.join(_APP_DIR, 'templates', 'template_doc3.hwp'),
+    'doc1': os.path.join(_APP_DIR, 'templates', 'template_doc1.hwpx'),
+    'doc2': os.path.join(_APP_DIR, 'templates', 'template_doc2.hwpx'),
+    'doc3': os.path.join(_APP_DIR, 'templates', 'template_doc3.hwpx'),
 }
 
 def hwp_replace_win32(hwp, find_str, replace_str):
@@ -1099,124 +1099,22 @@ def hwp_pad_replacement(old_str, new_str):
             new_str = new_str[:-1]
     return new_str
 
-def hwp_modify_template(template_path, replacements):
-    """순수 Python으로 HWP 템플릿의 텍스트를 교체 (olefile + zlib)"""
-    import olefile, zlib
+def hwpx_modify_template(template_path, replacements):
+    """python-hwpx로 HWPX 템플릿의 텍스트를 교체"""
+    from hwpx import HwpxDocument
 
-    tmp = tempfile.NamedTemporaryFile(suffix='.hwp', delete=False)
-    tmp_path = tmp.name
-    tmp.close()
-    shutil.copy2(template_path, tmp_path)
-
-    ole = olefile.OleFileIO(tmp_path, write_mode=True)
-
-    # BodyText/Section0 디컴프레스
-    orig_section = ole.openstream('BodyText/Section0').read()
-    orig_len = len(orig_section)
-    body = zlib.decompress(orig_section, -15)
-    orig_body_len = len(body)
-
-    # UTF-16LE 바이트 찾아바꾸기 (바이트 길이를 맞춰서 교체)
+    doc = HwpxDocument.open(template_path)
     for old_str, new_str in replacements:
-        padded_new = hwp_pad_replacement(old_str, new_str)
-        body = body.replace(
-            old_str.encode('utf-16-le'),
-            padded_new.encode('utf-16-le')
-        )
+        doc.replace_text_in_runs(old_str, new_str)
 
-    # 바디 크기가 원본과 같은지 확인
-    if len(body) != orig_body_len:
-        # 크기 차이 보정 (공백 패딩)
-        if len(body) < orig_body_len:
-            body += b'\x00' * (orig_body_len - len(body))
-        else:
-            body = body[:orig_body_len]
-
-    # 압축 파라미터 탐색으로 원본과 정확히 같은 크기 찾기
-    compressed = None
-    for level in range(1, 10):
-        for strategy in [0, 1, 2, 3, 4]:
-            for memLevel in range(1, 10):
-                try:
-                    co = zlib.compressobj(level, zlib.DEFLATED, -15, memLevel, strategy)
-                    candidate = co.compress(body) + co.flush()
-                    if len(candidate) == orig_len:
-                        compressed = candidate
-                        break
-                except:
-                    pass
-            if compressed:
-                break
-        if compressed:
-            break
-
-    if not compressed:
-        # 정확 일치 못 찾으면, 가장 가까운 작은 것 + 빈 final block
-        import struct
-        best_candidate = None
-        best_remaining = float('inf')
-        for level in range(1, 10):
-            for memLevel in range(1, 10):
-                try:
-                    co = zlib.compressobj(level, zlib.DEFLATED, -15, memLevel)
-                    candidate = co.compress(body) + co.flush(zlib.Z_SYNC_FLUSH)
-                    remaining = orig_len - len(candidate)
-                    if remaining == 5:
-                        # 빈 final block 정확히 맞음
-                        final = struct.pack('B', 0x01) + struct.pack('<HH', 0, 0xFFFF)
-                        compressed = candidate + final
-                        break
-                    elif 5 < remaining < best_remaining:
-                        best_candidate = candidate
-                        best_remaining = remaining
-                except:
-                    pass
-            if compressed:
-                break
-
-    if not compressed and best_candidate and best_remaining > 5:
-        # stored block으로 크기 맞추기 (빈 데이터)
-        import struct
-        remaining = orig_len - len(best_candidate)
-        data_len = remaining - 5
-        final = struct.pack('B', 0x01)
-        final += struct.pack('<H', data_len)
-        final += struct.pack('<H', data_len ^ 0xFFFF)
-        final += b'\x00' * data_len
-        compressed = best_candidate + final
-
-    if compressed and len(compressed) == orig_len:
-        ole.write_stream('BodyText/Section0', compressed)
-    else:
-        ole.close()
-        os.unlink(tmp_path)
-        raise RuntimeError(f"HWP 압축 크기 맞추기 실패")
-
-    # PrvText도 교체
-    orig_prv = ole.openstream('PrvText').read()
-    new_prv = orig_prv
-    for old_str, new_str in replacements:
-        padded_new = hwp_pad_replacement(old_str, new_str)
-        new_prv = new_prv.replace(
-            old_str.encode('utf-16-le'),
-            padded_new.encode('utf-16-le')
-        )
-    orig_prv_len = len(orig_prv)
-    if len(new_prv) < orig_prv_len:
-        new_prv += b'\x00' * (orig_prv_len - len(new_prv))
-    elif len(new_prv) > orig_prv_len:
-        new_prv = new_prv[:orig_prv_len]
-    ole.write_stream('PrvText', new_prv)
-
-    ole.close()
-
-    with open(tmp_path, 'rb') as f:
-        result = f.read()
-    os.unlink(tmp_path)
-    return result
+    buf = io.BytesIO()
+    doc.save_to_stream(buf)
+    doc.close()
+    buf.seek(0)
+    return buf.getvalue()
 
 def generate_hwp_files(recipe, options, db):
-    """HWP 파일 3종 생성 — 순수 Python (olefile + zlib 바이너리 교체)"""
+    """HWPX 파일 3종 생성 — python-hwpx (클라우드/로컬 모두 지원)"""
     product_name = recipe['product_name']
     ingredients = recipe['ingredients']
     storage_method = options.get('storage', '냉동')
@@ -1275,7 +1173,7 @@ def generate_hwp_files(recipe, options, db):
         ('밀봉 / 10g~5kg', f"밀봉 / {options.get('packaging_unit', '10g~5kg')}"),
         ('제조일로부터 9개월까지', f'제조일로부터 {shelf_life}까지'),
     ]
-    output_files['hwp1'] = hwp_modify_template(HWP_TEMPLATES['doc1'], doc1_replacements)
+    output_files['hwp1'] = hwpx_modify_template(HWP_TEMPLATES['doc1'], doc1_replacements)
 
     # ─── 2. 원료성분 및 배합비율 ───
     # 기존 호라산밀 데이터를 새 데이터로 교체
@@ -1310,7 +1208,7 @@ def generate_hwp_files(recipe, options, db):
                 break
         doc2_replacements.append((old_comp, ''))
 
-    output_files['hwp2'] = hwp_modify_template(HWP_TEMPLATES['doc2'], doc2_replacements)
+    output_files['hwp2'] = hwpx_modify_template(HWP_TEMPLATES['doc2'], doc2_replacements)
 
     # ─── 3. 소비기한설정사유서 ───
     doc3_replacements = [
@@ -1327,7 +1225,7 @@ def generate_hwp_files(recipe, options, db):
         doc3_replacements.append(('냉동( O )', '냉동(   )'))
         doc3_replacements.append(('실온(   )', '실온( O )'))
 
-    output_files['hwp3'] = hwp_modify_template(HWP_TEMPLATES['doc3'], doc3_replacements)
+    output_files['hwp3'] = hwpx_modify_template(HWP_TEMPLATES['doc3'], doc3_replacements)
 
     return output_files
 
@@ -1696,28 +1594,28 @@ if uploaded_file:
         # HWP 다운로드
         if 'hwp1' in files:
             st.markdown("---")
-            st.markdown("**한글 파일 (.hwp) — 기존 양식 그대로**")
+            st.markdown("**한글 파일 (.hwpx)**")
             hcol1, hcol2, hcol3 = st.columns(3)
 
             hcol1.download_button(
                 "1. 제조방법설명서 (HWP)",
                 files['hwp1'],
-                f"1. 제조방법설명서 - {product_name}.hwp",
-                mime="application/x-hwp"
+                f"1. 제조방법설명서 - {product_name}.hwpx",
+                mime="application/hwp+zip"
             )
 
             hcol2.download_button(
                 "2. 원료성분 및 배합비율 (HWP)",
                 files['hwp2'],
                 f"2. 원료성분 및 배합비율({product_name}).hwp",
-                mime="application/x-hwp"
+                mime="application/hwp+zip"
             )
 
             hcol3.download_button(
                 "3. 소비기한설정사유서 (HWP)",
                 files['hwp3'],
                 f"3. 소비기한설정사유서({product_name}).hwp",
-                mime="application/x-hwp"
+                mime="application/hwp+zip"
             )
         else:
             st.markdown("---")
