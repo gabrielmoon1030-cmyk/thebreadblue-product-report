@@ -1085,11 +1085,24 @@ def generate_hwp_files_win32(recipe, options, db):
 
     return output_files
 
+def hwp_pad_replacement(old_str, new_str):
+    """교체 문자열의 UTF-16LE 바이트 길이를 원본과 맞춤 (공백 패딩)"""
+    old_bytes = len(old_str.encode('utf-16-le'))
+    new_bytes = len(new_str.encode('utf-16-le'))
+    if new_bytes < old_bytes:
+        # 부족한 만큼 공백 추가
+        pad_chars = (old_bytes - new_bytes) // 2
+        new_str = new_str + ' ' * pad_chars
+    elif new_bytes > old_bytes:
+        # 넘치면 잘라내기 (마지막 수단)
+        while len(new_str.encode('utf-16-le')) > old_bytes:
+            new_str = new_str[:-1]
+    return new_str
+
 def hwp_modify_template(template_path, replacements):
     """순수 Python으로 HWP 템플릿의 텍스트를 교체 (olefile + zlib)"""
     import olefile, zlib
 
-    # 템플릿을 임시 파일로 복사
     tmp = tempfile.NamedTemporaryFile(suffix='.hwp', delete=False)
     tmp_path = tmp.name
     tmp.close()
@@ -1099,44 +1112,104 @@ def hwp_modify_template(template_path, replacements):
 
     # BodyText/Section0 디컴프레스
     orig_section = ole.openstream('BodyText/Section0').read()
-    body = zlib.decompress(orig_section, -15)
-
-    # UTF-16LE 바이트 찾아바꾸기
-    for old_str, new_str in replacements:
-        body = body.replace(old_str.encode('utf-16-le'), new_str.encode('utf-16-le'))
-
-    # 재압축 — 원본 크기에 맞춰야 함
     orig_len = len(orig_section)
-    new_section = None
-    for level in range(1, 10):
-        co = zlib.compressobj(level, zlib.DEFLATED, -15)
-        candidate = co.compress(body) + co.flush()
-        if len(candidate) <= orig_len:
-            new_section = candidate + b'\x00' * (orig_len - len(candidate))
-            break
-    if new_section is None:
-        # 압축해도 원본보다 크면 원본 크기로 자르기 (최후 수단)
-        co = zlib.compressobj(9, zlib.DEFLATED, -15)
-        new_section = (co.compress(body) + co.flush())[:orig_len]
+    body = zlib.decompress(orig_section, -15)
+    orig_body_len = len(body)
 
-    ole.write_stream('BodyText/Section0', new_section)
+    # UTF-16LE 바이트 찾아바꾸기 (바이트 길이를 맞춰서 교체)
+    for old_str, new_str in replacements:
+        padded_new = hwp_pad_replacement(old_str, new_str)
+        body = body.replace(
+            old_str.encode('utf-16-le'),
+            padded_new.encode('utf-16-le')
+        )
+
+    # 바디 크기가 원본과 같은지 확인
+    if len(body) != orig_body_len:
+        # 크기 차이 보정 (공백 패딩)
+        if len(body) < orig_body_len:
+            body += b'\x00' * (orig_body_len - len(body))
+        else:
+            body = body[:orig_body_len]
+
+    # 압축 파라미터 탐색으로 원본과 정확히 같은 크기 찾기
+    compressed = None
+    for level in range(1, 10):
+        for strategy in [0, 1, 2, 3, 4]:
+            for memLevel in range(1, 10):
+                try:
+                    co = zlib.compressobj(level, zlib.DEFLATED, -15, memLevel, strategy)
+                    candidate = co.compress(body) + co.flush()
+                    if len(candidate) == orig_len:
+                        compressed = candidate
+                        break
+                except:
+                    pass
+            if compressed:
+                break
+        if compressed:
+            break
+
+    if not compressed:
+        # 정확 일치 못 찾으면, 가장 가까운 작은 것 + 빈 final block
+        import struct
+        best_candidate = None
+        best_remaining = float('inf')
+        for level in range(1, 10):
+            for memLevel in range(1, 10):
+                try:
+                    co = zlib.compressobj(level, zlib.DEFLATED, -15, memLevel)
+                    candidate = co.compress(body) + co.flush(zlib.Z_SYNC_FLUSH)
+                    remaining = orig_len - len(candidate)
+                    if remaining == 5:
+                        # 빈 final block 정확히 맞음
+                        final = struct.pack('B', 0x01) + struct.pack('<HH', 0, 0xFFFF)
+                        compressed = candidate + final
+                        break
+                    elif 5 < remaining < best_remaining:
+                        best_candidate = candidate
+                        best_remaining = remaining
+                except:
+                    pass
+            if compressed:
+                break
+
+    if not compressed and best_candidate and best_remaining > 5:
+        # stored block으로 크기 맞추기 (빈 데이터)
+        import struct
+        remaining = orig_len - len(best_candidate)
+        data_len = remaining - 5
+        final = struct.pack('B', 0x01)
+        final += struct.pack('<H', data_len)
+        final += struct.pack('<H', data_len ^ 0xFFFF)
+        final += b'\x00' * data_len
+        compressed = best_candidate + final
+
+    if compressed and len(compressed) == orig_len:
+        ole.write_stream('BodyText/Section0', compressed)
+    else:
+        ole.close()
+        os.unlink(tmp_path)
+        raise RuntimeError(f"HWP 압축 크기 맞추기 실패")
 
     # PrvText도 교체
     orig_prv = ole.openstream('PrvText').read()
     new_prv = orig_prv
     for old_str, new_str in replacements:
-        new_prv = new_prv.replace(old_str.encode('utf-16-le'), new_str.encode('utf-16-le'))
-    # 크기 맞추기
+        padded_new = hwp_pad_replacement(old_str, new_str)
+        new_prv = new_prv.replace(
+            old_str.encode('utf-16-le'),
+            padded_new.encode('utf-16-le')
+        )
     orig_prv_len = len(orig_prv)
     if len(new_prv) < orig_prv_len:
-        new_prv = new_prv + b'\x00' * (orig_prv_len - len(new_prv))
+        new_prv += b'\x00' * (orig_prv_len - len(new_prv))
     elif len(new_prv) > orig_prv_len:
         new_prv = new_prv[:orig_prv_len]
     ole.write_stream('PrvText', new_prv)
 
     ole.close()
 
-    # 파일 읽어서 반환
     with open(tmp_path, 'rb') as f:
         result = f.read()
     os.unlink(tmp_path)
@@ -1529,14 +1602,20 @@ if uploaded_file:
             buf2 = io.BytesIO(); doc2.save(buf2); buf2.seek(0)
             buf3 = io.BytesIO(); doc3.save(buf3); buf3.seek(0)
 
-            # HWP 생성 (로컬 Windows + 한글 프로그램 설치 시에만)
+            # HWP 생성
             hwp_files = None
-            if os.name == 'nt':
-                try:
+            try:
+                if os.name == 'nt':
                     import win32com.client
                     hwp_files = generate_hwp_files_win32(recipe, options, db)
+            except:
+                hwp_files = None
+            if not hwp_files:
+                try:
+                    hwp_files = generate_hwp_files(recipe, options, db)
                 except Exception as e:
                     hwp_files = None
+                    st.warning(f"HWP 생성 실패: {e}")
 
             # session_state에 저장
             st.session_state.generated_files = {
@@ -1642,7 +1721,7 @@ if uploaded_file:
             )
         else:
             st.markdown("---")
-            st.caption("💡 HWP 파일은 한글 프로그램이 설치된 PC(로컬 http://localhost:8502)에서만 생성 가능합니다.")
+            st.caption("💡 HWP 생성에 실패했습니다. Word 또는 PDF 파일을 이용해주세요.")
 
         st.divider()
         st.info("💡 영양성분 정보가 필요하면 [영양성분 자동계산기](https://thebreadblue-nutrition-zh7cydsadtwdmymbyawsbz.streamlit.app/)를 이용하세요.")
