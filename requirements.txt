@@ -3,4 +3,4 @@ openpyxl
 python-docx
 reportlab
 olefile
-python-hwpx
+python-hwpx==2.8.3
