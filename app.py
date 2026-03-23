@@ -24,10 +24,11 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ─── 설정 ───
 st.set_page_config(page_title="품목제조보고서 자동생성", page_icon="📋", layout="wide")
 
-# 한글 폰트 등록 (PDF용)
+# 한글 폰트 등록 (PDF용) — 프로젝트 내 fonts/ 또는 시스템 폰트
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_PATHS = [
-    "C:/Windows/Fonts/malgun.ttf",
-    "C:/Windows/Fonts/malgunbd.ttf",
+    (os.path.join(_APP_DIR, "fonts", "malgun.ttf"), "C:/Windows/Fonts/malgun.ttf"),
+    (os.path.join(_APP_DIR, "fonts", "malgunbd.ttf"), "C:/Windows/Fonts/malgunbd.ttf"),
 ]
 FONT_REGISTERED = False
 def register_fonts():
@@ -35,8 +36,10 @@ def register_fonts():
     if FONT_REGISTERED:
         return
     try:
-        pdfmetrics.registerFont(TTFont('Malgun', FONT_PATHS[0]))
-        pdfmetrics.registerFont(TTFont('MalgunBold', FONT_PATHS[1]))
+        font_regular = next(p for p in FONT_PATHS[0] if os.path.exists(p))
+        font_bold = next(p for p in FONT_PATHS[1] if os.path.exists(p))
+        pdfmetrics.registerFont(TTFont('Malgun', font_regular))
+        pdfmetrics.registerFont(TTFont('MalgunBold', font_bold))
         FONT_REGISTERED = True
     except Exception as e:
         st.warning(f"폰트 등록 실패: {e}")
