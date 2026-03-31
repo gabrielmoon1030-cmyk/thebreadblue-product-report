@@ -3,3 +3,8 @@ __pycache__/
 pdf_page_*.png
 test_output.hwp
 alias_map.json
+*.hwp
+*.hwpx
+ocr_results.json
+sync_logs/
+__pycache__/
